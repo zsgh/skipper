@@ -16,7 +16,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # 免安装也�
 
 from skipper.temporal.client import (  # noqa: E402
     get_result,
-    query_state,
     submit_hello,
     submit_task,
 )

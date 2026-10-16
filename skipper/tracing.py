@@ -28,7 +28,7 @@ def setup_tracing(
         return False
 
     try:
-        from phoenix.otel import register
+        pass
     except Exception as exc:  # pragma: no cover - 依赖缺失时
         logger.warning("arize-phoenix-otel 不可用，跳过 tracing: %s", exc)
         return False

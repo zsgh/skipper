@@ -133,7 +133,7 @@ async def _cli(argv=None) -> int:
 
     if args.wait:
         result = await get_result(info["task_id"], settings=settings)
-        print(f"Plan:")
+        print("Plan:")
         _print_plan(result.get("plan", {}))
         print(f"\nStatus: {result['status']}  (总耗时 {result.get('total_duration_ms', 0)} ms)")
         print(f"\n最终输出:\n{result.get('final_output', '')}")

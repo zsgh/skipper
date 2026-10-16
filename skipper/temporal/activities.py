@@ -21,7 +21,6 @@ from skipper.planner import parse as plan_parse
 from skipper.planner import prompts
 from skipper.planner.schema import Plan, SubtaskResult, TaskResult
 
-
 # ── Activity 运行上下文（worker 启动时注入）──────────────────
 
 

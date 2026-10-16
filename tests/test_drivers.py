@@ -10,7 +10,6 @@ from skipper.config import Settings
 from skipper.drivers import AgentDriver, DriverRegistry, OpencodeDriver, SelfLoopDriver
 from skipper.planner.schema import SubtaskResult
 
-
 # ── 测试替身 ────────────────────────────────────────────────
 
 

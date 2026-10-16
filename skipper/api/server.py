@@ -67,7 +67,6 @@ async def task_result(task_id: str) -> dict:
 def main() -> None:
     import uvicorn
 
-    settings = get_settings()
     uvicorn.run(app, host="0.0.0.0", port=8500, log_level="info")
 
 

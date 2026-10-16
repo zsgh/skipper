@@ -11,7 +11,7 @@ import uuid
 
 import pytest
 
-from skipper.clients.berth import BerthClient, BerthError
+from skipper.clients.berth import BerthClient
 from skipper.config import Settings, get_settings
 from skipper.llm import create_llm_client
 from skipper.planner.schema import TaskResult

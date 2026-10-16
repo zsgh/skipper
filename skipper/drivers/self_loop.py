@@ -17,7 +17,7 @@ from __future__ import annotations
 import asyncio
 import re
 import time
-from typing import List, Optional, Set, Tuple
+from typing import List, Optional, Set
 
 from skipper import tracing
 from skipper.clients.berth import BerthClient, BerthError

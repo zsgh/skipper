@@ -106,20 +106,36 @@ s4 的沙箱里会自动出现接力过来的 `a.txt`/`b.txt`/`c.txt`。
 
 ```bash
 bash scripts/kill_and_resume.sh
-# 提交任务 → 杀掉 worker → 重启 → 任务从断点继续
-# 对比 ActivityTaskScheduled 次数：已完成的 activity 没有被重跑
 ```
+
+流程：提交任务（3 个子任务：s1/s2 并行写文件，s3 依赖它们合并）→ 杀掉 worker（SIGTERM 模拟崩溃）
+→ 重启 worker → 任务从断点继续。实测输出：
+
+```
+plan_task          kill 前调度 1 次 → 完成后共 1 次
+run_subtask        kill 前调度 3 次 → 完成后共 3 次
+aggregate_results  kill 前调度 0 次 → 完成后共 1 次
+（值不变 = 已完成的 activity 没有重跑；resume 只补跑没做完的）
+```
+
+s1/s2 在 kill 前已完成，重启后被**直接复用**（没有重新调度）；s3 被 kill 打断，重启后
+attempt=2 继续，并且拿到了接力过来的 a.txt/b.txt。
 
 ### demo 4：双驱动对比
 
-同一件事：**写文件 → 读取打印**（含一次依赖接力）分别用两个 driver 跑：
+同一个任务：**「计算 1 到 100 的和并打印，保存到 `/workspace/sum.txt`」**，
+两个 driver 各跑一遍（`scripts/benchmark.py --runs 1 --tasks 4 --driver both`）：
 
-| 驱动 | 耗时 | 步骤 | LLM token | 产物 | 结果 |
+| 驱动 | 耗时 | 子任务数 | LLM token | 产物 | 结果 |
 |---|---|---|---|---|---|
-| self_loop | 待填 | 1 子任务 | 待填 | 待填 | ✅ completed |
-| opencode | 待填 | 2 子任务 | 待填 | 待填 | ✅ completed |
+| self_loop | 19.9s | 1 | 495 | `sum.txt` | ✅ completed |
+| opencode | 29.2s | 1 | n/a* | `sum.txt` | ✅ completed |
 
-> 数据由双驱动评测产生（`results/` 下留存 JSON）。opencode 需要在宿主机上构建
+4 个任务 × 各 1 次汇总：**self_loop 成功率 100% / 平均 22.6s / 平均 749 tokens**；
+**opencode 成功率 100% / 平均 32.8s**（token 数需要 `SKIPPER_OPENCODE_FORMAT=json`，
+让 opencode 输出 JSON 事件流后才能统计）。
+
+> 数据由双驱动评测产生（`results/dual-driver.json`）。opencode 需要在宿主机上构建
 > `opencode` 镜像：`sudo scripts/build_opencode_rootfs.sh`。
 
 ### 评测集
@@ -129,7 +145,8 @@ python scripts/benchmark.py --runs 3 --driver both        # 10 任务 × 3 次 �
 python scripts/benchmark.py --runs 1 --tasks 4 --driver both --json results/bench.json
 ```
 
-统计成功率 / 平均耗时 / 平均 token，结果写入 `results/`。
+实测（10 个任务 × 1 次，self_loop）：**成功率 100%，平均 35.9s，平均 2117 tokens**
+（`results/benchmark-self-loop-10.json`）。统计成功率 / 平均耗时 / 平均 token，结果写入 `results/`。
 
 ## 目录结构
 

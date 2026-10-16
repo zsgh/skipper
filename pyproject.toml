@@ -41,3 +41,20 @@ testpaths = ["tests"]
 markers = [
     "integration: 需要真实服务（berth / temporal / LLM）",
 ]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "RUF"]
+ignore = [
+    "E501",    # 行宽不强制（注释多为中文）
+    "RUF001",  # 中文全角标点
+    "RUF002",
+    "RUF003",
+    "RUF013",  # 隐式 Optional 的类型写法
+    "RUF022",  # __all__ 排序
+    "RUF100",  # 保留手工 noqa
+    "RUF046",  # int() 显式转换更清晰
+]
