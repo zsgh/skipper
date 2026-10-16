@@ -17,6 +17,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from skipper.clients.berth import BerthClient  # noqa: E402
+from skipper.config import get_settings  # noqa: E402
 from skipper.temporal.client import get_result, submit_task  # noqa: E402
 
 # 10 个沙箱友好的任务（可验证、无真实账号依赖）
@@ -68,6 +70,34 @@ async def run_once(task: str, driver: str, timeout: float) -> dict:
     }
 
 
+async def cleanup_sandboxes(result: dict) -> int:
+    """清理这次运行用过的 berth 沙箱工作区。
+
+    opencode 每个子任务会在 /workspace 留下 ~100MB+ 的 npm 缓存 / git 快照，
+    不清会把 berth 宿主机磁盘写满（任务书里的运维提醒：定期清理）。
+    """
+    sandboxes = [
+        r.get("sandbox_id")
+        for r in (result.get("subtask_results") or [])
+        if r.get("sandbox_id")
+    ]
+    if not sandboxes:
+        return 0
+    settings = get_settings()
+    berth = BerthClient(settings.berth_base_url)
+    cleaned = 0
+    try:
+        for sandbox_id in sandboxes:
+            try:
+                berth.clear_script(sandbox_id)
+                cleaned += 1
+            except Exception:
+                pass
+    finally:
+        berth.close()
+    return cleaned
+
+
 def summarize(rows: list[dict]) -> dict:
     ok = [r for r in rows if r["status"] in ("completed", "partial")]
     return {
@@ -85,21 +115,29 @@ async def main() -> int:
     parser.add_argument("--timeout", type=float, default=900, help="单个任务等待上限（秒）")
     parser.add_argument("--tasks", type=int, default=len(TASKS), help="只跑前 N 个任务")
     parser.add_argument("--json", dest="json_path", default=None, help="结果写到哪里")
+    parser.add_argument(
+        "--keep-sandboxes",
+        action="store_true",
+        help="跑完不清 berth 沙箱工作区（默认每个任务跑完就清，避免写满磁盘）",
+    )
     args = parser.parse_args()
 
     drivers = ["self_loop", "opencode"] if args.driver == "both" else [args.driver]
     tasks = TASKS[: args.tasks]
 
     rows: list[dict] = []
-    print(f"benchmark: {len(tasks)} tasks × {args.runs} runs × drivers={drivers}")
+    print(f"benchmark: {len(tasks)} tasks × {args.runs} runs × drivers={drivers}", flush=True)
     for driver in drivers:
         for i, task in enumerate(tasks, 1):
             for run in range(1, args.runs + 1):
                 row = await run_once(task, driver, args.timeout)
                 rows.append(row)
+                if not args.keep_sandboxes:
+                    await cleanup_sandboxes(row.get("result") or {})
                 print(
                     f"[{driver}] task {i}/{len(tasks)} run {run}/{args.runs}: "
-                    f"{row['status']:<10} {row['duration_ms']:>7} ms  {row['tokens']:>6} tokens"
+                    f"{row['status']:<10} {row['duration_ms']:>7} ms  {row['tokens']:>6} tokens",
+                    flush=True,
                 )
 
     print("\n== 汇总 ==")
