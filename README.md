@@ -171,8 +171,9 @@ skipper/
 
 ```bash
 pytest                                  # 单元测试（不依赖外部服务）
-pytest tests/test_integration.py        # 集成测试（berth / Temporal / LLM 探测不到就 skip）
-SKIPPER_E2E=1 pytest tests/test_integration.py   # 加跑完整 AgentTaskWorkflow
+pytest tests/test_integration.py        # 集成测试（berth / Temporal / LLM 探测不到就 skip；
+                                        #  opencode 镜像不存在时对应用例自动 skip）
+SKIPPER_E2E=1 pytest tests/test_integration.py   # 加跑完整 AgentTaskWorkflow（self_loop + opencode）
 ```
 
 ## 实现注记（踩过的坑）
@@ -183,7 +184,9 @@ SKIPPER_E2E=1 pytest tests/test_integration.py   # 加跑完整 AgentTaskWorkflo
 | berth 的 /proc 泄漏宿主路径 | opencode 探测项目根失败（realPath ENOENT） | driver 先 `git init /workspace` + 显式 `--dir` |
 | opencode 内存 | Bun 运行时 > 256MB 被 cgroup/全局 OOM 杀 | `SKIPPER_OPENCODE_MEMORY_MB`（默认 1024），berth 宿主机建议 4GB+ |
 | npm 在 chroot 误判 libc | 装了 musl 版 opencode | 构建 rootfs 时挂载 `/proc`（`build_opencode_rootfs.sh` 已处理） |
+| opencode 事件流太长 | stdout 被 berth 截断（10k） | 沙箱内落盘解析，只回传 `{final_text, tokens, steps}` 摘要 |
 | Phoenix + Temporal 插件 | 全局 provider 必须是 ReplaySafe；Simple exporter 在 sandbox 里报错 | `create_tracer_provider()` + `BatchSpanProcessor` |
+| Phoenix 里 kind/input/output 空白 | 普通 attribute 不显示 | `tracing.span(kind=..., input=..., output=...)` 统一写 OpenInference 语义属性 |
 | 子任务沙箱隔离 | 下游读不到上游文件 | 依赖产物接力（文本 ≤8KB/文件）+ 上游输出摘要拼进描述 |
 
 ## 验收状态

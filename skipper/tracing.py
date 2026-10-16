@@ -2,6 +2,13 @@
 
 - worker 启动时调用 setup_tracing()
 - 业务代码用 skipper.tracing.span() 埋点，没开 tracing 时是 no-op
+
+span 内容遵循 OpenInference 语义约定（Phoenix UI 的 kind / input / output 列
+就是读这些属性）：
+    openinference.span.kind = CHAIN | TOOL | LLM | ...
+    input.value / input.mime_type
+    output.value / output.mime_type
+    session.id                （workflow_id：Phoenix 的 Sessions 视图按它聚合）
 """
 from __future__ import annotations
 
@@ -10,6 +17,8 @@ import logging
 from typing import Iterator, Optional
 
 logger = logging.getLogger(__name__)
+
+MAX_SPAN_TEXT = 4000  # 单个 input/output 的截断长度
 
 _tracer_provider = None
 _enabled = False
@@ -28,7 +37,7 @@ def setup_tracing(
         return False
 
     try:
-        pass
+        from phoenix.otel import register  # noqa: F401  （依赖检查）
     except Exception as exc:  # pragma: no cover - 依赖缺失时
         logger.warning("arize-phoenix-otel 不可用，跳过 tracing: %s", exc)
         return False
@@ -84,21 +93,88 @@ def tracer():
     return trace.get_tracer("skipper")
 
 
+# ── span 内容写入（OpenInference 语义）──────────────────────
+
+
+def _truncate(text: str, limit: int = MAX_SPAN_TEXT) -> str:
+    text = "" if text is None else str(text)
+    if len(text) <= limit:
+        return text
+    return text[: limit - 20] + f"...[截断 {len(text) - limit + 20} 字符]"
+
+
+def _set_attr(sp, key: str, value) -> None:
+    if sp is None or value is None:
+        return
+    try:
+        sp.set_attribute(key, value if isinstance(value, (str, int, float, bool)) else str(value))
+    except Exception:  # pragma: no cover
+        pass
+
+
+def set_span_kind(sp, kind: str) -> None:
+    """CHAIN（编排）/ TOOL（执行）/ LLM / AGENT …，Phoenix 的 kind 列。"""
+    _set_attr(sp, "openinference.span.kind", kind)
+
+
+def set_span_input(sp, text: str, mime_type: str = "text/plain") -> None:
+    _set_attr(sp, "input.value", _truncate(text))
+    _set_attr(sp, "input.mime_type", mime_type)
+
+
+def set_span_output(sp, text: str, mime_type: str = "text/plain") -> None:
+    _set_attr(sp, "output.value", _truncate(text))
+    _set_attr(sp, "output.mime_type", mime_type)
+
+
+def set_span_session(sp, session_id: str) -> None:
+    """session.id（= workflow_id）：Phoenix Sessions 视图按任务聚合。"""
+    _set_attr(sp, "session.id", session_id)
+
+
+def mark_error(sp, exc: BaseException) -> None:
+    """span 标红：record_exception + status=ERROR。"""
+    if sp is None:
+        return
+    try:
+        sp.record_exception(exc)
+        from opentelemetry.trace import Status, StatusCode
+
+        sp.set_status(Status(StatusCode.ERROR, str(exc)[:200]))
+    except Exception:  # pragma: no cover
+        pass
+
+
 @contextlib.contextmanager
-def span(name: str, **attributes) -> Iterator[object]:
-    """统一的埋点入口。无 tracing 时是 no-op 上下文。"""
+def span(
+    name: str,
+    *,
+    kind: Optional[str] = None,
+    input: Optional[str] = None,  # noqa: A002 - 对齐 OpenInference 的 input.value
+    output: Optional[str] = None,
+    session_id: Optional[str] = None,
+    **attributes,
+) -> Iterator[object]:
+    """统一的埋点入口。无 tracing 时是 no-op 上下文。
+
+    input/output 还没确定时（比如要等调用结果出来），先传 None，
+    拿到结果后在 with 块内调用 set_span_input / set_span_output。
+    """
     t = tracer()
     if t is None:
         yield None
         return
     with t.start_as_current_span(name) as sp:
+        if kind:
+            set_span_kind(sp, kind)
+        if input is not None:
+            set_span_input(sp, input)
+        if output is not None:
+            set_span_output(sp, output)
+        if session_id:
+            set_span_session(sp, session_id)
         for key, value in attributes.items():
-            if value is None:
-                continue
-            try:
-                sp.set_attribute(key, value if isinstance(value, (str, int, float, bool)) else str(value))
-            except Exception:  # pragma: no cover
-                pass
+            _set_attr(sp, key, value)
         yield sp
 
 

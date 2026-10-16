@@ -11,7 +11,7 @@ import uuid
 
 import pytest
 
-from skipper.clients.berth import BerthClient
+from skipper.clients.berth import BerthClient, BerthError
 from skipper.config import Settings, get_settings
 from skipper.llm import create_llm_client
 from skipper.planner.schema import TaskResult
@@ -90,9 +90,33 @@ def test_berth_artifacts_and_timeout(berth):
         berth.clear_script(task_id)
 
 
+def _opencode_version(berth: BerthClient) -> dict | None:
+    """探测 berth 上有没有 opencode 镜像；没有返回 None。"""
+    try:
+        result = berth.run_script(
+            cmd=["/usr/bin/env", "HOME=/tmp", "/usr/bin/opencode", "--version"],
+            task_id=f"itest-oc-probe-{uuid.uuid4().hex[:8]}",
+            timeout=60,
+            image="opencode",
+        )
+    except BerthError:
+        return None
+    if result.get("exit_code") != 0:
+        return None
+    return result
+
+
 def test_berth_lists_services(berth):
     services = berth.list_services(all=True)
     assert isinstance(services, list)
+
+
+def test_berth_opencode_image_smoke(berth):
+    """opencode 镜像可用性（先生成 rootfs：scripts/build_opencode_rootfs.sh）。"""
+    result = _opencode_version(berth)
+    if result is None:
+        pytest.skip("berth 上没有可用的 opencode 镜像（先跑 scripts/build_opencode_rootfs.sh）")
+    assert result["stdout"].strip(), result
 
 
 # ── LLM planning（真实 LLM）──────────────────────────────────
@@ -195,4 +219,50 @@ async def test_e2e_agent_workflow_with_self_loop(settings, berth, llm):
     assert all(r.status == "completed" for r in parsed.subtask_results), [
         (r.subtask_id, r.error) for r in parsed.subtask_results
     ]
-    print(f"e2e 耗时 {time.time() - started:.1f}s, final_output={parsed.final_output[:200]!r}")
+    print(f"e2e(self_loop) 耗时 {time.time() - started:.1f}s, final_output={parsed.final_output[:200]!r}")
+
+
+@pytest.mark.skipif(os.environ.get("SKIPPER_E2E") != "1", reason="设置 SKIPPER_E2E=1 才跑完整链路")
+async def test_e2e_agent_workflow_with_opencode(settings, berth, llm):
+    """opencode 驱动的完整链路：写文件 → 依赖接力 → 读取打印。"""
+    if not await _temporal_reachable(settings):
+        pytest.skip(f"Temporal 不可达: {settings.temporal_address}")
+    if _opencode_version(berth) is None:
+        pytest.skip("berth 上没有可用的 opencode 镜像（先跑 scripts/build_opencode_rootfs.sh）")
+
+    from temporalio.client import Client
+    from temporalio.worker import Worker
+
+    from skipper.drivers import DriverRegistry
+    from skipper.temporal import activities
+    from skipper.temporal.workflows import AgentTaskWorkflow
+
+    registry = DriverRegistry(berth, llm, settings=settings)
+    activities.configure(berth=berth, registry=registry, llm=llm, settings=settings)
+
+    client = await Client.connect(settings.temporal_address, namespace=settings.temporal_namespace)
+    queue = f"itest-{uuid.uuid4().hex[:8]}"
+    started = time.time()
+    async with Worker(
+        client,
+        task_queue=queue,
+        workflows=[AgentTaskWorkflow],
+        activities=[activities.plan_task, activities.run_subtask, activities.aggregate_results],
+    ):
+        result = await client.execute_workflow(
+            AgentTaskWorkflow.run,
+            args=[
+                "在 /workspace 写一个文件 oc_notes.txt，内容为 'opencode in berth'，然后打印文件内容。",
+                "opencode",
+            ],
+            id=f"itest-oc-agent-{uuid.uuid4().hex[:8]}",
+            task_queue=queue,
+        )
+    parsed = TaskResult.model_validate(result)
+    assert parsed.status == "completed", [
+        (r.subtask_id, r.status, r.error) for r in parsed.subtask_results
+    ]
+    assert all(r.driver == "opencode" for r in parsed.subtask_results)
+    artifacts = {a for r in parsed.subtask_results for a in r.artifacts}
+    assert "oc_notes.txt" in artifacts, artifacts
+    print(f"e2e(opencode) 耗时 {time.time() - started:.1f}s, final_output={parsed.final_output[:200]!r}")

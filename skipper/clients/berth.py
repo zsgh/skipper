@@ -119,13 +119,19 @@ class BerthClient:
 
         with tracing.span(
             "berth.run_script",
+            kind="TOOL",
+            input=code if code is not None else " ".join(cmd or []),
             task_id=task_id or "",
             image=payload["image"],
             timeout=timeout,
             language=language or ("cmd" if cmd else ""),
-        ):
+        ) as sp:
             # HTTP 超时给足余量：脚本 timeout + 沙箱准备/清理
             result = self._post("/scripts/run", json=payload, timeout=timeout + 60)
+            output_text = f"exit_code={result.get('exit_code')}\n{result.get('stdout', '')}"
+            if result.get("stderr"):
+                output_text += f"\n[stderr]\n{result['stderr']}"
+            tracing.set_span_output(sp, output_text)
 
         if isinstance(result, dict):
             result.setdefault("task_id", task_id)

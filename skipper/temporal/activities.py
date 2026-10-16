@@ -56,6 +56,14 @@ def get_context() -> ActivityContext:
     return _ctx
 
 
+def _workflow_id() -> Optional[str]:
+    """当前 activity 所属 workflow id（tracing session 用）。"""
+    try:
+        return activity.info().workflow_id
+    except Exception:  # 非 activity 上下文（测试）
+        return None
+
+
 # ── plan_task ───────────────────────────────────────────────
 
 PLAN_MAX_ATTEMPTS = 3
@@ -79,9 +87,17 @@ async def plan_task(task: str) -> dict:
 
     last_error: Optional[Exception] = None
     for attempt in range(1, PLAN_MAX_ATTEMPTS + 1):
-        with tracing.span("plan_task.llm_call", attempt=attempt, model=model, task=task[:200]):
+        with tracing.span(
+            "plan_task.llm_call",
+            kind="CHAIN",
+            input=task,
+            session_id=_workflow_id(),
+            attempt=attempt,
+            model=model,
+        ) as sp:
             resp = await _chat_with_json_fallback(ctx, model=model, messages=messages)
-        raw = _message_text(resp)
+            raw = _message_text(resp)
+            tracing.set_span_output(sp, raw, mime_type="application/json")
 
         try:
             plan = plan_parse.parse_plan(raw)
@@ -150,12 +166,25 @@ async def run_subtask(
 
     # 上游产物接力：文件内容 → 本沙箱 /workspace；输出摘要 → 任务描述
     task_description = subtask["description"]
+    session_id = _workflow_id()
     if upstream_results:
+        seeded: List[str] = []
+        hsp = None
         try:
-            seeded = await _handoff_upstream(ctx.berth, upstream_results, sandbox_id)
+            with tracing.span(
+                "run_subtask.handoff",
+                kind="TOOL",
+                session_id=session_id,
+                from_subtasks=[r["subtask_id"] for r in upstream_results],
+            ) as hsp:
+                seeded = await _handoff_upstream(ctx.berth, upstream_results, sandbox_id)
+                tracing.set_span_output(
+                    hsp, f"seeded: {', '.join(seeded)}" if seeded else "(没有可接力的文本产物)"
+                )
             if seeded:
                 activity.logger.info("子任务 %s 接力上游产物: %s", subtask_id, seeded)
         except Exception as exc:  # 接力失败不阻塞执行
+            tracing.mark_error(hsp, exc)
             activity.logger.warning("上游产物接力失败（忽略）: %s", exc)
         task_description = (
             subtask["description"]
@@ -165,10 +194,13 @@ async def run_subtask(
 
     with tracing.span(
         "run_subtask",
+        kind="CHAIN",
+        input=task_description,
+        session_id=session_id,
         subtask_id=subtask_id,
         driver=requested,
         sandbox_id=sandbox_id,
-    ):
+    ) as sp:
         try:
             result = await _run_with_heartbeats(
                 driver.run(
@@ -179,6 +211,7 @@ async def run_subtask(
                 )
             )
         except Exception as exc:  # driver 不允许把异常抛给 workflow
+            tracing.mark_error(sp, exc)
             result = SubtaskResult(
                 subtask_id=subtask_id,
                 status="failed",
@@ -187,6 +220,12 @@ async def run_subtask(
                 output="",
                 error=f"{type(exc).__name__}: {exc}",
             ).model_dump()
+
+        output_text = result.get("output") or result.get("error") or ""
+        artifacts = result.get("artifacts") or []
+        if artifacts:
+            output_text += f"\n\n[artifacts] {', '.join(artifacts)}"
+        tracing.set_span_output(sp, f"[{result.get('status')}] {output_text}")
 
     result["subtask_id"] = subtask_id
     result["sandbox_id"] = sandbox_id
@@ -328,22 +367,32 @@ async def aggregate_results(task: str, plan: dict, results: list) -> dict:
     final_output = fallback_output
     aggregation = "concat"
     if ctx.llm is not None and subtask_results:
+        agg_input = _aggregation_input(task, subtask_results)
+        sp = None
         try:
-            with tracing.span("aggregate_results.llm_call", subtask_count=len(subtask_results)):
+            with tracing.span(
+                "aggregate_results.llm_call",
+                kind="CHAIN",
+                input=agg_input,
+                session_id=_workflow_id(),
+                subtask_count=len(subtask_results),
+            ) as sp:
                 resp = await _chat_with_json_fallback(
                     ctx,
                     model=ctx.settings.llm_model,
                     messages=[
                         {"role": "system", "content": prompts.AGGREGATE_SYSTEM_PROMPT},
-                        {"role": "user", "content": _aggregation_input(task, subtask_results)},
+                        {"role": "user", "content": agg_input},
                     ],
                     json_mode=False,
                 )
-            text = _message_text(resp).strip()
+                text = _message_text(resp).strip()
+                tracing.set_span_output(sp, text or "(空)")
             if text:
                 final_output = text
                 aggregation = "llm"
         except Exception as exc:
+            tracing.mark_error(sp, exc)
             activity.logger.warning("汇总 LLM 调用失败，退化为拼接: %s", exc)
 
     artifacts = sorted({a for r in subtask_results for a in r.artifacts})
@@ -393,7 +442,18 @@ async def run_hello(code: str = "print('hello')") -> dict:
     if ctx.berth is None:
         raise ApplicationError("run_hello 缺少 berth 客户端", non_retryable=True)
     task_id = f"hello-{activity.info().workflow_id}"
-    result = await ctx.berth.arun_script(code=code, task_id=task_id, timeout=60)
+    with tracing.span(
+        "run_hello",
+        kind="TOOL",
+        input=code,
+        session_id=_workflow_id(),
+        sandbox_id=task_id,
+    ) as sp:
+        result = await ctx.berth.arun_script(code=code, task_id=task_id, timeout=60)
+        tracing.set_span_output(
+            sp,
+            f"exit_code={result.get('exit_code')}\n{result.get('stdout', '')}",
+        )
     if result.get("exit_code") != 0:
         raise ApplicationError(
             f"berth 执行失败（exit={result.get('exit_code')}）: {result.get('stderr', '')[:500]}"

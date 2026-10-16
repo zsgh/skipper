@@ -15,8 +15,7 @@
 from __future__ import annotations
 
 import json
-import os
-from typing import List, Optional, Tuple
+from typing import Optional
 
 from skipper import tracing
 from skipper.artifacts import filter_task_artifacts
@@ -25,14 +24,19 @@ from skipper.config import Settings, get_settings
 from skipper.drivers.base import AgentDriver
 from skipper.planner.schema import SubtaskResult
 
-# 包装器：设置 cwd / 环境变量 → 跑 opencode → 透传输出与退出码
+# 包装器：设置 cwd / 环境变量 → 跑 opencode（json 事件流落盘）→ 沙箱内解析出
+# 「最终文本 + token 用量」摘要回传。
+#
+# 为什么事件流落盘再解析：
+# - opencode --format json 的事件流很长，直接走 stdout 会被 berth 截断（10k）；
+# - 沙箱内解析后只回传一个小 JSON 摘要，绕过截断，还能拿到准确的 token 数。
 #
 # 两个 sandbox 适配点（berth 的 overlayfs + pivot_root 环境）：
 # 1) opencode 靠 git 探测项目根；/proc/self/mountinfo 里的宿主路径会让它的
 #    realPath 探测失败 → 先 git init 一个空仓库，让项目根 = /workspace；
 # 2) 显式传 --dir /workspace，避免它从挂载点反推目录。
 _SANDBOX_WRAPPER = '''\
-import os, subprocess, sys
+import json, os, subprocess, sys
 
 os.makedirs("/workspace", exist_ok=True)
 os.chdir("/workspace")
@@ -43,24 +47,72 @@ if not os.path.isdir("/workspace/.git"):
 env = os.environ.copy()
 env.update({env_repr})
 
+events_path = "/tmp/opencode-events.jsonl"
+stderr = ""
 try:
-    proc = subprocess.run(
-        {argv_repr},
-        capture_output=True, text=True, timeout={subprocess_timeout},
-        cwd="/workspace", env=env,
-    )
+    with open(events_path, "w") as events_file:
+        proc = subprocess.run(
+            {argv_repr},
+            stdout=events_file, stderr=subprocess.PIPE, text=True,
+            timeout={subprocess_timeout}, cwd="/workspace", env=env,
+        )
+    exit_code = proc.returncode
+    stderr = proc.stderr or ""
 except subprocess.TimeoutExpired as exc:
-    out = exc.stdout or ""
+    exit_code = 124
     err = exc.stderr or ""
-    sys.stdout.write(out if isinstance(out, str) else out.decode("utf-8", "replace"))
-    sys.stderr.write(err if isinstance(err, str) else err.decode("utf-8", "replace"))
-    sys.stderr.write("\\nERROR: opencode 执行超时（{subprocess_timeout}s）")
-    raise SystemExit(124)
+    stderr = err if isinstance(err, str) else err.decode("utf-8", "replace")
+    stderr = (stderr + "\\nERROR: opencode 执行超时").strip()
 
-sys.stdout.write(proc.stdout)
-sys.stderr.write(proc.stderr)
-raise SystemExit(proc.returncode)
+# 沙箱内解析事件流：最终文本 + token 用量（best-effort）
+final_text = ""
+tokens = 0
+steps = 0
+try:
+    with open(events_path, encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line.startswith("{{"):
+                continue
+            try:
+                event = json.loads(line)
+            except ValueError:
+                continue
+            part = event.get("part") or {{}}
+            etype = (event.get("type") or part.get("type") or "").replace("_", "-")
+            if etype == "text" and isinstance(part.get("text"), str) and part["text"].strip():
+                final_text = part["text"]
+            elif etype == "step-finish":
+                steps += 1
+                usage = part.get("tokens") or {{}}
+                try:
+                    total = int(usage.get("total") or 0)
+                    if not total:
+                        total = (
+                            int(usage.get("input") or 0)
+                            + int(usage.get("output") or 0)
+                            + int(usage.get("reasoning") or 0)
+                        )
+                    tokens += total
+                except (TypeError, ValueError):
+                    pass
+except OSError:
+    pass
+
+summary = {{
+    "exit_code": exit_code,
+    "final_text": final_text[:6000],
+    "tokens": tokens,
+    "steps": steps,
+    "stderr_tail": stderr.strip()[-800:],
+}}
+sys.stdout.write("__OPENCODE_RESULT__" + json.dumps(summary, ensure_ascii=False))
+if stderr:
+    sys.stderr.write(stderr[-2000:])
+raise SystemExit(exit_code)
 '''
+
+SUMMARY_MARKER = "__OPENCODE_RESULT__"
 DEFAULT_PROVIDER_ID = "skipper"
 
 
@@ -154,10 +206,8 @@ class OpencodeDriver(AgentDriver):
             f"{self.provider_id}/{self.model}",
             "--auto",
         ]
-        # SKIPPER_OPENCODE_FORMAT=json 时输出 JSON 事件流（便于统计 token，输出更长）
-        output_format = os.environ.get("SKIPPER_OPENCODE_FORMAT", "").strip().lower()
-        if output_format in {"json", "default"}:
-            argv += ["--format", output_format]
+        # 固定用 json 事件流（包装器落盘后在沙箱内解析，回传 final_text + tokens）
+        argv += ["--format", "json"]
         if self.debug:
             argv.append("--print-logs")
         argv.append(task)
@@ -182,6 +232,8 @@ class OpencodeDriver(AgentDriver):
 
         with tracing.span(
             "driver.opencode.sandbox_run",
+            kind="TOOL",
+            input=f"[task]\n{task}\n\n[argv]\n{' '.join(argv)}",
             sandbox_id=sandbox_id,
             image=self.image,
             model=f"{self.provider_id}/{self.model}",
@@ -197,6 +249,7 @@ class OpencodeDriver(AgentDriver):
                     cpu_percent=self.cpu_percent,
                 )
             except BerthError as exc:
+                tracing.mark_error(sp, exc)
                 hint = ""
                 if "未知镜像" in str(exc) or "image" in str(exc).lower():
                     hint = "（先跑 scripts/build_opencode_rootfs.sh 构建 image=opencode）"
@@ -206,6 +259,11 @@ class OpencodeDriver(AgentDriver):
                     sp.set_attribute("exit_code", int(result.get("exit_code", 0)))
                 except Exception:  # pragma: no cover
                     pass
+            tracing.set_span_output(
+                sp,
+                f"exit_code={result.get('exit_code')}\n{result.get('stdout', '')}"
+                f"\n[stderr]\n{result.get('stderr', '')}",
+            )
 
         stdout = result.get("stdout", "") or ""
         stderr = result.get("stderr", "") or ""
@@ -213,9 +271,17 @@ class OpencodeDriver(AgentDriver):
         artifacts = filter_task_artifacts(result.get("artifacts"))
         duration_ms = int(round(float(result.get("duration", 0)) * 1000))
 
-        # 尝试从 json 事件流里提取更干净的最终回复（best-effort）
-        final_text, tokens = _extract_json_events(stdout)
-        output = final_text or stdout.strip()
+        # 包装器回传的摘要：最终文本 + token 用量 + opencode 的 stderr
+        summary = _parse_summary(stdout)
+        output = stdout.strip()
+        tokens = 0
+        steps = None
+        if summary:
+            output = (summary.get("final_text") or "").strip() or output
+            tokens = int(summary.get("tokens") or 0)
+            steps = summary.get("steps")
+            if summary.get("stderr_tail"):
+                stderr = summary["stderr_tail"]
 
         if exit_code == 0:
             status = "completed"
@@ -241,6 +307,7 @@ class OpencodeDriver(AgentDriver):
                 "exit_code": exit_code,
                 "model": f"{self.provider_id}/{self.model}",
                 "llm_tokens": tokens,
+                "steps": steps,
                 "stderr_tail": stderr.strip()[-500:] if stderr else "",
             },
         )
@@ -258,75 +325,20 @@ class OpencodeDriver(AgentDriver):
         ).model_dump()
 
 
-# ── best-effort：解析 `--format json` 事件流 ─────────────────
-
-_TEXT_KEYS = ("text", "content", "message")
-_USAGE_KEYS = ("input_tokens", "output_tokens", "prompt_tokens", "completion_tokens")
+# ── 解析包装器回传的摘要 ─────────────────────────────────────
 
 
-def _extract_json_events(stdout: str) -> Tuple[Optional[str], int]:
-    """从 opencode --format json 的事件流里提取最终文本与 token 用量。
+def _parse_summary(stdout: str) -> Optional[dict]:
+    """从沙箱 stdout 里找 `__OPENCODE_RESULT__{json}` 摘要。"""
+    if not stdout:
+        return None
+    marker_at = stdout.rfind(SUMMARY_MARKER)
+    if marker_at < 0:
+        return None
+    payload = stdout[marker_at + len(SUMMARY_MARKER) :].strip()
+    try:
+        data = json.loads(payload)
+    except ValueError:
+        return None
+    return data if isinstance(data, dict) else None
 
-    只做尽力而为：解析失败就返回 (None, 0)，调用方回退用原始 stdout。
-    """
-    if not stdout or not stdout.lstrip().startswith("{"):
-        return None, 0
-
-    texts: List[str] = []
-    tokens = 0
-    parsed_any = False
-    for line in stdout.splitlines():
-        line = line.strip()
-        if not line.startswith("{"):
-            continue
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        parsed_any = True
-        tokens += _find_tokens(event)
-        candidate = _find_text(event)
-        if candidate:
-            texts.append(candidate)
-
-    if not parsed_any:
-        return None, 0
-    final = "\n".join(texts).strip() if texts else None
-    return final, tokens
-
-
-def _find_tokens(obj) -> int:
-    total = 0
-    if isinstance(obj, dict):
-        if any(k in obj for k in _USAGE_KEYS):
-            try:
-                total += int(obj.get("input_tokens", obj.get("prompt_tokens", 0)) or 0)
-                total += int(obj.get("output_tokens", obj.get("completion_tokens", 0)) or 0)
-                return total
-            except (TypeError, ValueError):
-                return 0
-        for value in obj.values():
-            total += _find_tokens(value)
-    elif isinstance(obj, list):
-        for value in obj:
-            total += _find_tokens(value)
-    return total
-
-
-def _find_text(obj) -> Optional[str]:
-    if isinstance(obj, dict):
-        # opencode 事件大致形如 {"type":"text","part":{"text":"..."}}
-        if obj.get("type") == "text" and isinstance(obj.get("part"), dict):
-            text = obj["part"].get("text")
-            if isinstance(text, str) and text.strip():
-                return text
-        for value in obj.values():
-            found = _find_text(value)
-            if found:
-                return found
-    elif isinstance(obj, list):
-        for value in obj:
-            found = _find_text(value)
-            if found:
-                return found
-    return None

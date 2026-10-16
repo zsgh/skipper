@@ -115,6 +115,14 @@ def _format_observation(result: dict) -> str:
     return "\n".join(lines)
 
 
+def _render_messages(messages: List[dict]) -> str:
+    """把对话渲染成文本，给 span 的 input 用。"""
+    parts = []
+    for m in messages:
+        parts.append(f"[{m.get('role', '?')}]\n{m.get('content', '')}")
+    return "\n\n".join(parts)
+
+
 class SelfLoopDriver(AgentDriver):
     def __init__(
         self,
@@ -184,8 +192,16 @@ class SelfLoopDriver(AgentDriver):
                     break
                 turns += 1
 
-                with tracing.span("driver.self_loop.llm_turn", turn=turns, model=self.model) as sp:
+                with tracing.span(
+                    "driver.self_loop.llm_turn",
+                    kind="CHAIN",
+                    input=_render_messages(messages),
+                    turn=turns,
+                    model=self.model,
+                ) as sp:
                     resp = await self._chat(messages)
+                    text = self._message_text(resp)
+                    tracing.set_span_output(sp, text or "(空)")
                     if sp is not None and getattr(resp, "usage", None) is not None:
                         usage = resp.usage
                         try:
@@ -197,7 +213,6 @@ class SelfLoopDriver(AgentDriver):
                             pass
                 llm_tokens += self._extract_tokens(resp)
 
-                text = self._message_text(resp)
                 last_assistant_text = text or last_assistant_text
                 code = extract_code(text)
                 done = _DONE_SENTINEL in (text or "")
@@ -286,7 +301,12 @@ class SelfLoopDriver(AgentDriver):
         wrapped = _EXEC_WRAPPER.format(code_repr=repr(code))
         berth_timeout = max(5, min(remaining_seconds, 600))
 
-        with tracing.span("driver.self_loop.sandbox_exec", sandbox_id=sandbox_id) as sp:
+        with tracing.span(
+            "driver.self_loop.sandbox_exec",
+            kind="TOOL",
+            input=code,
+            sandbox_id=sandbox_id,
+        ) as sp:
             try:
                 result = await asyncio.to_thread(
                     self.berth.run_script,
@@ -297,6 +317,7 @@ class SelfLoopDriver(AgentDriver):
                     image="base",
                 )
             except BerthError as exc:
+                tracing.mark_error(sp, exc)
                 return f"Observation:\nberth 调用失败: {exc}"
 
             if sp is not None:
@@ -304,10 +325,12 @@ class SelfLoopDriver(AgentDriver):
                     sp.set_attribute("exit_code", int(result.get("exit_code", 0)))
                 except Exception:  # pragma: no cover
                     pass
+            observation = _format_observation(result)
+            tracing.set_span_output(sp, observation)
 
         for artifact in result.get("artifacts") or []:
             artifacts.add(artifact)
-        return _format_observation(result)
+        return observation
 
     @staticmethod
     def _message_text(resp) -> str:

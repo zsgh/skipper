@@ -1,6 +1,7 @@
 """Driver 层测试：接口统一性 + SelfLoopDriver（FakeLLM/FakeBerth）+ OpencodeDriver 命令构造。"""
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -265,3 +266,36 @@ def test_filter_task_artifacts_strips_runtime_noise():
         "reports/summary.csv",
     ]
     assert filter_task_artifacts(artifacts) == ["notes.txt", "reports/summary.csv"]
+
+
+async def test_opencode_parses_sandbox_summary():
+    """沙箱包装器回传的 __OPENCODE_RESULT__ 摘要 → output / tokens / steps。"""
+    summary = {
+        "exit_code": 0,
+        "final_text": "最终回答",
+        "tokens": 1234,
+        "steps": 3,
+        "stderr_tail": "",
+    }
+    berth = FakeBerth(
+        results=[
+            {
+                "stdout": "noise\n__OPENCODE_RESULT__" + json.dumps(summary, ensure_ascii=False),
+                "stderr": "",
+                "exit_code": 0,
+                "duration": 1.0,
+                "artifacts": [],
+            }
+        ]
+    )
+    driver = OpencodeDriver(berth, settings=make_settings())
+    result = await driver.run("任务", "task-1-s1", max_turns=1, timeout=60)
+    parsed = SubtaskResult.model_validate(result)
+    assert parsed.status == "completed"
+    assert parsed.output == "最终回答"
+    assert parsed.metadata["llm_tokens"] == 1234
+    assert parsed.metadata["steps"] == 3
+    # 包装器必须把事件流落盘解析（避免 berth 10k 截断），并且永远带 --format json
+    code = berth.calls[0]["code"]
+    assert "--format" in code and "json" in code
+    assert "opencode-events.jsonl" in code

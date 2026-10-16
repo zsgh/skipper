@@ -96,7 +96,18 @@ RunWorkflow:AgentTaskWorkflow
 └── StartActivity:aggregate_results → ... → ChatCompletion
 ```
 
-- 每个 span 带 `subtask_id` / `driver` / `sandbox_id` 属性；activity 结果里有 `trace_id` 可以互查。
+- **span 内容遵循 OpenInference 语义约定**（Phoenix UI 的 kind / input / output 列）：
+  - `openinference.span.kind`：编排类 span 是 `CHAIN`、沙箱执行类是 `TOOL`、
+    模型调用是 `LLM`（openinference 的 OpenAI 埋点自动打）；
+  - `input.value` / `output.value`：任务描述、生成的代码、stdout、模型回复等
+    （统一截断 4000 字符）；
+  - `session.id = workflow_id`：Phoenix 的 Sessions 视图把一个任务的全部 span
+    （planning + 所有并行子任务）聚成一条链。
+- 失败会 `record_exception` + span status=ERROR（Phoenix 里标红）。
+- 每个 span 还带 `subtask_id` / `driver` / `sandbox_id` 属性；activity 结果里有 `trace_id` 可以互查。
+- 两个 driver 的执行统计（轮数 / token）落在 `SubtaskResult.metadata`：
+  `self_loop` 报 `turns` + `llm_tokens`；`opencode` 报 `steps` + `llm_tokens`
+  （从沙箱内解析的事件流里统计）。
 
 ## 配置
 

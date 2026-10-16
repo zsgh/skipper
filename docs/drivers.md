@@ -52,7 +52,8 @@ LLM 生成 python 代码 → berth /scripts/run 执行 → stdout/stderr 回填 
 ```
 Skipper → berth /scripts/run(image="opencode")
     → python 包装器（git init + chdir /workspace + 注入环境变量）
-    → opencode run --dir /workspace --model skipper/<model> --auto "<子任务>"
+    → opencode run --dir /workspace --format json --model skipper/<model> --auto "<子任务>"
+    → 沙箱内解析事件流 → 回传 {final_text, tokens, steps} 摘要
 ```
 
 - **前置**：`scripts/build_opencode_rootfs.sh` 在 berth 宿主机上构建 image 名为 `opencode`
@@ -60,6 +61,9 @@ Skipper → berth /scripts/run(image="opencode")
 - **密钥不落盘**：provider 配置通过 `OPENCODE_CONFIG_CONTENT`（内联 JSON）注入，
   API key 用 `{env:SKIPPER_LLM_API_KEY}` 占位，真实值随这一次沙箱执行的环境变量传入。
 - provider 用 `@ai-sdk/openai-compatible` 自定义（任何 OpenAI 兼容端点都能接）。
+- **事件流落盘解析**：`--format json` 的事件流很长，直接走 stdout 会被 berth 截断（10k）；
+  包装器把它写到沙箱内 `/tmp/opencode-events.jsonl`，解析出「最终文本 + token 用量 + step 数」
+  后只回传一个小 JSON 摘要（`__OPENCODE_RESULT__{...}`），所以 `metadata.llm_tokens` 是准的。
 - 两个沙箱适配点（见代码注释）：
   1. opencode 靠 git 探测项目根，而 berth 的 `/proc/self/mountinfo` 会暴露宿主路径 →
      driver 先 `git init /workspace`；
