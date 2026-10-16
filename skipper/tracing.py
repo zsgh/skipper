@@ -32,6 +32,8 @@ def setup_tracing(
     """初始化 Phoenix OTLP trace。返回是否成功启用。"""
     global _tracer_provider, _enabled
 
+    if _enabled:
+        return True  # 幂等：client / worker 可能都调一次
     if not enabled:
         logger.info("tracing disabled (SKIPPER_TRACING=0)")
         return False

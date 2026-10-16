@@ -14,6 +14,7 @@ from typing import Optional
 
 from temporalio.client import Client, WorkflowHandle
 
+from skipper import tracing
 from skipper.config import Settings, get_settings
 from skipper.temporal.workflows import AgentTaskWorkflow, HelloWorkflow
 
@@ -21,8 +22,21 @@ DEFAULT_EXECUTION_TIMEOUT = timedelta(hours=3)
 
 
 async def get_client(settings: Optional[Settings] = None) -> Client:
+    """连接 Temporal；开着 tracing 时挂上 OTel 插件（trace 树会从客户端出发）。"""
     settings = settings or get_settings()
-    return await Client.connect(settings.temporal_address, namespace=settings.temporal_namespace)
+    plugins = []
+    if settings.tracing_enabled:
+        tracing.setup_tracing(
+            project_name=settings.phoenix_project,
+            endpoint=settings.phoenix_endpoint,
+            enabled=True,
+        )
+        plugins = tracing.temporal_plugins()
+    return await Client.connect(
+        settings.temporal_address,
+        namespace=settings.temporal_namespace,
+        plugins=plugins,
+    )
 
 
 def new_task_id() -> str:
@@ -36,22 +50,37 @@ async def submit_task(
     task_id: Optional[str] = None,
     settings: Optional[Settings] = None,
 ) -> dict:
-    """提交一个用户任务，返回 {task_id, run_id, tracking_url}。"""
+    """提交一个用户任务，返回 {task_id, run_id, tracking_url}。
+
+    提交动作本身也是一个 span（trace 的根）：input=任务描述，
+    session.id=task_id，context 会随 header 传进 workflow，
+    所以 Phoenix 的 Traces 列表第一行就能看到任务本身。
+    """
     settings = settings or get_settings()
     client = await get_client(settings)
     task_id = task_id or new_task_id()
-    handle = await client.start_workflow(
-        AgentTaskWorkflow.run,
-        args=[task, driver],
-        id=task_id,
-        task_queue=settings.temporal_task_queue,
-        execution_timeout=DEFAULT_EXECUTION_TIMEOUT,
+    tracking_url = (
+        f"{settings.temporal_ui_base}/namespaces/{settings.temporal_namespace}/workflows/{task_id}"
     )
+    with tracing.span(
+        "skipper.submit_task",
+        kind="CHAIN",
+        input=task,
+        output=f"task_id={task_id}\ndriver={driver}\n{tracking_url}",
+        session_id=task_id,
+    ):
+        handle = await client.start_workflow(
+            AgentTaskWorkflow.run,
+            args=[task, driver],
+            id=task_id,
+            task_queue=settings.temporal_task_queue,
+            execution_timeout=DEFAULT_EXECUTION_TIMEOUT,
+        )
     return {
         "task_id": task_id,
         "run_id": handle.result_run_id,
         "driver": driver,
-        "tracking_url": f"{settings.temporal_ui_base}/namespaces/{settings.temporal_namespace}/workflows/{task_id}",
+        "tracking_url": tracking_url,
     }
 
 
@@ -60,13 +89,20 @@ async def submit_hello(code: str = "print('hello')", *, settings: Optional[Setti
     settings = settings or get_settings()
     client = await get_client(settings)
     task_id = f"hello-{uuid.uuid4().hex[:12]}"
-    handle = await client.start_workflow(
-        HelloWorkflow.run,
-        code,
-        id=task_id,
-        task_queue=settings.temporal_task_queue,
-        execution_timeout=timedelta(minutes=10),
-    )
+    with tracing.span(
+        "skipper.submit_hello",
+        kind="CHAIN",
+        input=code,
+        output=f"task_id={task_id}",
+        session_id=task_id,
+    ):
+        handle = await client.start_workflow(
+            HelloWorkflow.run,
+            code,
+            id=task_id,
+            task_queue=settings.temporal_task_queue,
+            execution_timeout=timedelta(minutes=10),
+        )
     return {"task_id": task_id, "run_id": handle.result_run_id, "handle": handle}
 
 
