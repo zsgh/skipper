@@ -1,0 +1,16 @@
+# venv / 环境
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+.env
+
+# 运行产物
+results/
+*.log
+.temporal/
+.pytest_cache/
+.ruff_cache/

@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "skipper"
+version = "0.1.0"
+description = "Skipper orchestrates, berth executes. Temporal 编排 + 可插拔 Driver + berth 沙箱执行。"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "temporalio>=1.7.0,<2",
+    "httpx[socks]>=0.27",
+    "pydantic>=2.6",
+    "openai>=1.30",
+    "python-dotenv>=1.0",
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
+    # 可观测性（阶段五）
+    "opentelemetry-api>=1.25",
+    "opentelemetry-sdk>=1.25",
+    "opentelemetry-exporter-otlp>=1.25",
+    "openinference-instrumentation-openai>=0.1.9",
+    "arize-phoenix-otel>=0.6",
+]
+
+[project.optional-dependencies]
+phoenix = ["arize-phoenix>=4.0"]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "arize-phoenix>=4.0"]
+
+[project.scripts]
+skipper = "skipper.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["skipper*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+markers = [
+    "integration: 需要真实服务（berth / temporal / LLM）",
+]
