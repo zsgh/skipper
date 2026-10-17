@@ -70,10 +70,16 @@ cp .env.example .env
 #   SKIPPER_LLM_API_KEY=sk-...
 #   SKIPPER_LLM_MODEL=gpt-4o-mini
 
-# 3) 三个终端
-temporal server start-dev                 # 终端 1：Temporal（UI :8233）
-phoenix serve --port 6006                 # 终端 2（可选）：trace UI
-python -m skipper.temporal.worker         # 终端 3：Skipper worker
+# 3) 一键拉起本地依赖（Temporal / Phoenix / worker / FastAPI；已在跑的会跳过）
+bash scripts/start_dev.sh
+
+#    等价的手动方式：
+#    temporal server start-dev --ui-port 8233 --port 7233
+#    phoenix serve --port 6006
+#    python -m skipper.temporal.worker
+
+#    重启机器后先跑这个检查状态（Temporal 数据持久化在 .temporal/skipper.db）：
+#    bash scripts/start_dev.sh --status
 
 # 4) 提交任务
 python scripts/submit_task.py "写三个文件 a.txt/b.txt/c.txt 分别放 A/B/C，再把三个文件合并成 merged.txt" --driver self_loop
